@@ -2,7 +2,13 @@ const TelegramBot = require('node-telegram-bot-api');
 const sharp = require('sharp');
 
 const bot = new TelegramBot(process.env.BOT_TOKEN, {
-  polling: true
+  polling: {
+    interval: 300,
+    autoStart: true,
+    params: {
+      timeout: 10
+    }
+  }
 });
 
 const API_KEY = process.env.MASSIVE_API_KEY;
