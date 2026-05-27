@@ -41,8 +41,8 @@ const blockedSymbols = new Set();
 let botPaused = false;
 let scanIndex = 0;
 
-// فحص سهم واحد كل 3 دقائق لتخفيف الضغط على Massive
-const SCAN_INTERVAL_MS = 3 * 60 * 1000;
+// فحص سهم واحد كل 5 دقائق لتخفيف الضغط على Massive
+const SCAN_INTERVAL_MS = 5 * 60 * 1000;
 const UPDATE_INTERVAL_MS = 30 * 1000;
 
 const MIN_CONTRACT_PRICE = 1.50;
