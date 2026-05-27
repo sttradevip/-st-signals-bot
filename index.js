@@ -1147,70 +1147,36 @@ async function sendTradeEntry(trade) {
   const text =
 `🚨 صفقة ST VIP
 
-📊 السهم:
-${trade.symbol}
+📊 السهم: ${trade.symbol}
+📈 النوع: ${trade.type} / ${sideArabic(trade.type)}
+🎯 السترايك: ${trade.strike}
+📅 الانتهاء: ${trade.expiration}
 
-📈 النوع:
-${trade.type} / ${sideArabic(trade.type)}
+💰 الدخول: $${fmtPrice(trade.entry)}
+🎯 الهدف: $${fmtPrice(trade.target)}
+🛑 الوقف: $${fmtPrice(trade.stop)}
 
-🎯 السترايك:
-${trade.strike}
+💵 Bid: $${fmtPrice(trade.bid)}
+💵 Ask: $${fmtPrice(trade.ask)}
 
-📅 الانتهاء:
-${trade.expiration}
+📦 Volume: ${fmt(trade.volume)}
+📂 OI: ${fmt(trade.oi)}
 
-━━━━━━━━━━━━━━
-
-💰 الدخول:
-$${fmtPrice(trade.entry)}
-
-🎯 الهدف:
-$${fmtPrice(trade.target)}
-
-🛑 الوقف:
-$${fmtPrice(trade.stop)}
-
-━━━━━━━━━━━━━━
-
-💵 Bid:
-$${fmtPrice(trade.bid)}
-
-💵 Ask:
-$${fmtPrice(trade.ask)}
-
-📦 Volume:
-${fmt(trade.volume)}
-
-📂 OI:
-${fmt(trade.oi)}
-
-━━━━━━━━━━━━━━
-
-Δ Delta:
-${
+Δ Delta: ${
   trade.delta !== undefined &&
   trade.delta !== null
     ? Number(trade.delta).toFixed(2)
     : 'غير متوفر'
 }
-
-Γ Gamma:
-${gammaText(trade.gamma)}
-
-IV:
-${
+Γ Gamma: ${gammaText(trade.gamma)}
+IV: ${
   trade.iv !== undefined &&
   trade.iv !== null
-    ? fmtPercent(
-        Number(trade.iv) * 100
-      )
+    ? fmtPercent(Number(trade.iv) * 100)
     : 'غير متوفر'
 }
 
-━━━━━━━━━━━━━━
-
-⭐ جودة الفلترة:
-${trade.score}
+⭐ جودة الفلترة: ${trade.score}
 
 🔥 ST TRADE VIP`;
 
