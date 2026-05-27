@@ -28,7 +28,7 @@ const ADMIN_IDS = String(process.env.ADMIN_IDS || '')
   .filter(Boolean);
 
 const SYMBOLS = String(
-  process.env.SIGNAL_SYMBOLS || 'AMD,AMZN,PLTR,NVDA,TSLA,QQQ,SPY'
+  process.env.SIGNAL_SYMBOLS || 'AMD,AMZN,PLTR,NVDA,TSLA,QQQ,SPY,GOOG,GOOGL'
 )
   .split(',')
   .map(x => x.trim().toUpperCase())
@@ -44,6 +44,9 @@ let scanIndex = 0;
 // فحص سهم واحد كل 5 دقائق لتخفيف الضغط على Massive
 const SCAN_INTERVAL_MS = 5 * 60 * 1000;
 const UPDATE_INTERVAL_MS = 30 * 1000;
+
+// إعادة تحليل بيانات العقد كل دقيقتين حتى لا تبقى LOADED
+const ANALYSIS_REFRESH_MS = 2 * 60 * 1000;
 
 const MIN_CONTRACT_PRICE = 1.50;
 const MAX_CONTRACT_PRICE = 2.50;
@@ -429,8 +432,8 @@ async function loadOpenTradesFromSupabase() {
       }
 
       const trade = {
-        symbol: row.symbol,
-        type: row.type,
+        symbol: String(row.symbol || '').toUpperCase(),
+        type: String(row.type || '').toUpperCase(),
         strike: row.strike,
         expiration: row.expiration,
 
@@ -451,24 +454,26 @@ async function loadOpenTradesFromSupabase() {
         profit20Sent: !!row.profit_20_sent,
         profit30Sent: !!row.profit_30_sent,
 
-        volume: 0,
-        oi: 0,
+        volume: null,
+        oi: null,
         delta: null,
         gamma: null,
         theta: null,
         iv: null,
-        bid: 0,
-        ask: 0,
+        bid: null,
+        ask: null,
 
-        score: 0,
+        score: null,
         technicalBias: 'LOADED',
         technicalScore: 0,
-        technicalReason: 'تم تحميل الصفقة من قاعدة البيانات',
-        contractQuality: 0,
-        smartFlow: 0,
+        technicalReason: 'بانتظار تحديث التحليل من Massive',
+        contractQuality: null,
+        smartFlow: null,
         flowBias: 'LOADED',
         flowStrength: 'LOADED',
-        dte: daysToExpiration(row.expiration)
+        dte: daysToExpiration(row.expiration),
+
+        lastAnalysisAt: 0
       };
 
       activeTrades.set(tradeKey(trade.symbol), trade);
@@ -1242,7 +1247,8 @@ function selectBestContract(
     profit30Sent: false,
 
     messageId: null,
-    status: 'OPEN'
+    status: 'OPEN',
+    lastAnalysisAt: Date.now()
   };
 }
 // =====================
@@ -1298,12 +1304,12 @@ IV: ${
       : 'غير متوفر'
   }
 
-📊 الاتجاه الفني: ${trade.technicalBias}
-🧠 سبب الفلترة: ${trade.technicalReason}
-⭐ جودة العقد: ${trade.contractQuality}
-🔥 تدفق ذكي: ${trade.smartFlow}
+📊 الاتجاه الفني: ${trade.technicalBias || 'غير متوفر'}
+🧠 سبب الفلترة: ${trade.technicalReason || 'غير متوفر'}
+⭐ جودة العقد: ${fmt(trade.contractQuality)}
+🔥 تدفق ذكي: ${fmt(trade.smartFlow)}
 
-⭐ جودة الفلترة: ${trade.score}
+⭐ جودة الفلترة: ${fmt(trade.score)}
 
 ⏱ آخر تحديث:
 ${new Date().toLocaleString('ar-SA', {
@@ -1573,7 +1579,117 @@ ${percent}%
 // Trade Updates
 // =====================
 
-async function refreshTradePrice(trade) {
+function normalizeOptionSnapshot(snapshot) {
+  return snapshot?.results || snapshot?.ticker || snapshot;
+}
+
+function applySnapshotToTrade(trade, item) {
+  if (!item) return;
+
+  const bid = getBid(item);
+  const ask = getAsk(item);
+  const volume = getVolume(item);
+  const oi = getOI(item);
+
+  if (bid > 0) trade.bid = bid;
+  if (ask > 0) trade.ask = ask;
+
+  if (volume > 0) trade.volume = volume;
+  if (oi > 0) trade.oi = oi;
+
+  const delta = getDelta(item);
+  const gamma = getGamma(item);
+  const theta = getTheta(item);
+  const iv = getIV(item);
+
+  if (delta !== undefined && delta !== null) trade.delta = delta;
+  if (gamma !== undefined && gamma !== null) trade.gamma = gamma;
+  if (theta !== undefined && theta !== null) trade.theta = theta;
+  if (iv !== undefined && iv !== null) trade.iv = iv;
+
+  trade.dte = daysToExpiration(trade.expiration);
+}
+
+function findSameContract(chain, trade, fallbackItem) {
+  const wantedTicker = String(trade.contractTicker || '').toUpperCase();
+  const wantedType = String(trade.type || '').toUpperCase();
+  const wantedStrike = Number(trade.strike);
+  const wantedExp = String(trade.expiration || '');
+
+  const found = (chain || []).find(item => {
+    const ticker = String(getContractTicker(item) || '').toUpperCase();
+    const type = getContractType(item);
+    const strike = Number(getStrike(item));
+    const exp = String(getExpiration(item) || '');
+
+    return (
+      ticker === wantedTicker ||
+      (
+        type === wantedType &&
+        strike === wantedStrike &&
+        exp === wantedExp
+      )
+    );
+  });
+
+  return found || fallbackItem;
+}
+
+async function enrichTradeAnalysis(trade, snapshotItem) {
+  const now = Date.now();
+
+  const mustRefresh =
+    !trade.lastAnalysisAt ||
+    trade.technicalBias === 'LOADED' ||
+    trade.contractQuality === null ||
+    trade.smartFlow === null ||
+    trade.score === null ||
+    now - trade.lastAnalysisAt >= ANALYSIS_REFRESH_MS;
+
+  if (!mustRefresh) return;
+
+  try {
+    const stock = await getStockSnapshot(trade.symbol);
+    if (!stock) return;
+
+    const technicalBias = await getTechnicalBias(trade.symbol);
+    const chain = await getOptionsChain(trade.symbol);
+    const flowBias = getFlowBias(chain, stock);
+
+    const item = findSameContract(chain, trade, snapshotItem);
+
+    if (!item) {
+      trade.technicalBias = technicalBias?.side || trade.technicalBias || 'غير متوفر';
+      trade.technicalScore = technicalBias?.score || 0;
+      trade.technicalReason = technicalBias?.reason || 'تم تحديث السعر فقط';
+      trade.lastAnalysisAt = now;
+      return;
+    }
+
+    applySnapshotToTrade(trade, item);
+
+    trade.technicalBias = technicalBias?.side || 'NEUTRAL';
+    trade.technicalScore = technicalBias?.score || 0;
+    trade.technicalReason = technicalBias?.reason || 'غير متوفر';
+
+    trade.flowBias = flowBias.side;
+    trade.flowStrength = flowBias.strength;
+
+    trade.contractQuality = contractQualityScore(item, stock);
+    trade.smartFlow = smartFlowScore(item, stock, flowBias);
+    trade.score = contractScore(item, stock, flowBias, technicalBias);
+
+    trade.lastAnalysisAt = now;
+
+    console.log(
+      `✅ تحليل محدث ${trade.symbol}: Volume=${trade.volume} OI=${trade.oi} Delta=${trade.delta} IV=${trade.iv}`
+    );
+  } catch (err) {
+    console.error(`Enrich Analysis Error ${trade.symbol}:`, err.message);
+  }
+}
+
+async function refreshTradeData(trade) {
   const snapshot = await getOptionSnapshot(
     trade.symbol,
     trade.contractTicker
@@ -1581,10 +1697,9 @@ async function refreshTradePrice(trade) {
 
   if (!snapshot) return null;
 
-  const data =
-    snapshot?.results ||
-    snapshot?.ticker ||
-    snapshot;
+  const data = normalizeOptionSnapshot(snapshot);
+
+  applySnapshotToTrade(trade, data);
 
   const bid = Number(data?.last_quote?.bid || 0);
   const ask = Number(data?.last_quote?.ask || 0);
@@ -1608,8 +1723,7 @@ async function refreshTradePrice(trade) {
     return null;
   }
 
-  trade.bid = bid;
-  trade.ask = ask;
+  await enrichTradeAnalysis(trade, data);
 
   console.log(
     `🔄 تحديث ${trade.symbol} ${trade.type} ${trade.strike}: ${trade.current} → ${current.toFixed(2)}`
@@ -1617,13 +1731,12 @@ async function refreshTradePrice(trade) {
 
   return Number(current.toFixed(2));
 }
-
 async function updateActiveTrades() {
   for (const [symbol, trade] of activeTrades.entries()) {
     try {
       if (trade.status !== 'OPEN') continue;
 
-      const current = await refreshTradePrice(trade);
+      const current = await refreshTradeData(trade);
       if (!current) continue;
 
       trade.current = current;
@@ -1680,6 +1793,7 @@ async function updateActiveTrades() {
     }
   }
 }
+
 // =====================
 // Scanner
 // =====================
@@ -2063,6 +2177,7 @@ bot.onText(/\/update/, async (msg) => {
 
 (async () => {
   await loadOpenTradesFromSupabase();
+  await updateActiveTrades();
   await scanForTrades();
 
   setInterval(
