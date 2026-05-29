@@ -13,6 +13,7 @@ const bot = new TelegramBot(process.env.BOT_TOKEN, {
 });
 
 const API_KEY = process.env.MASSIVE_API_KEY;
+const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -46,6 +47,10 @@ const SYMBOLS_PER_SCAN = 2;
 
 const UPDATE_INTERVAL_MS = 60 * 1000;
 const ANALYSIS_REFRESH_MS = 3 * 60 * 1000;
+
+// سعر السهم من Finnhub فقط لتخفيف Massive
+const FINNHUB_PRICE_CACHE_MS = 30 * 1000;
+const finnhubPriceCache = new Map();
 
 // وقف فني فقط
 const TECHNICAL_STOP_CHECK_MS = 2 * 60 * 1000;
@@ -218,6 +223,7 @@ function distancePercent(strike, stockPrice) {
 
   return Math.abs(((s - p) / p) * 100);
 }
+
 function daysToExpiration(dateStr) {
   if (!dateStr) return 999;
 
@@ -351,7 +357,6 @@ async function saveTradeToSupabase(trade) {
     console.error('Supabase Insert Error:', err.message);
   }
 }
-
 async function updateTradeInSupabase(trade) {
   try {
     const { error } = await supabase
@@ -420,6 +425,7 @@ function markTradeActive(trade) {
   activeTrades.set(tradeKey(trade.symbol), trade);
   saveTradeToSupabase(trade);
 }
+
 async function loadOpenTradesFromSupabase() {
   try {
     const { data, error } = await supabase
@@ -499,6 +505,56 @@ async function loadOpenTradesFromSupabase() {
 }
 
 // =====================
+// Finnhub Price API
+// =====================
+
+async function getStockPriceFromFinnhub(symbol) {
+  symbol = String(symbol || '').trim().toUpperCase();
+
+  if (!symbol || !FINNHUB_API_KEY) {
+    return null;
+  }
+
+  const cached = finnhubPriceCache.get(symbol);
+
+  if (
+    cached &&
+    cached.price &&
+    Date.now() - cached.time < FINNHUB_PRICE_CACHE_MS
+  ) {
+    return cached.price;
+  }
+
+  try {
+    const url =
+      `https://finnhub.io/api/v1/quote?symbol=${symbol}&token=${FINNHUB_API_KEY}`;
+
+    const res = await fetch(url);
+    const data = await res.json();
+
+    if (!res.ok) {
+      throw new Error(data?.error || data?.message || 'Finnhub API Error');
+    }
+
+    const price = Number(data?.c);
+
+    if (!price || price <= 0) {
+      return null;
+    }
+
+    finnhubPriceCache.set(symbol, {
+      price,
+      time: Date.now()
+    });
+
+    return price;
+  } catch (err) {
+    console.error(`Finnhub Price Error ${symbol}:`, err.message);
+    return null;
+  }
+}
+
+// =====================
 // Massive API
 // =====================
 
@@ -548,11 +604,14 @@ async function getStockSnapshot(symbol) {
 
   if (!r) return null;
 
-  const change = r.o ? ((r.c - r.o) / r.o) * 100 : null;
+  const finnhubPrice = await getStockPriceFromFinnhub(symbol);
+  const price = finnhubPrice || Number(r.c);
+
+  const change = r.o ? ((price - r.o) / r.o) * 100 : null;
 
   return {
     symbol,
-    price: r.c,
+    price,
     open: r.o,
     high: r.h,
     low: r.l,
@@ -579,6 +638,12 @@ async function getIntradayCandles(symbol) {
 }
 
 async function getLatestStockPrice(symbol) {
+  const finnhubPrice = await getStockPriceFromFinnhub(symbol);
+
+  if (finnhubPrice) {
+    return finnhubPrice;
+  }
+
   try {
     const candles = await getIntradayCandles(symbol);
 
@@ -610,7 +675,6 @@ async function getOptionSnapshot(symbol, contractTicker) {
 
   return data.results || data;
 }
-
 // =====================
 // Image Card
 // =====================
@@ -654,6 +718,7 @@ async function createTradeImage(type) {
 
   return await sharp(Buffer.from(svg)).png().toBuffer();
 }
+
 // =====================
 // Technical Engine
 // =====================
@@ -814,8 +879,9 @@ async function getTechnicalTarget2(symbol, type) {
       return null;
     }
 
+    const stockPrice = await getLatestStockPrice(symbol);
     const last = candles[candles.length - 1];
-    const price = Number(last.c);
+    const price = stockPrice || Number(last.c);
 
     const recent = candles.slice(-TECHNICAL_TARGET_LOOKBACK_BARS);
 
@@ -845,6 +911,7 @@ async function getTechnicalTarget2(symbol, type) {
     return null;
   }
 }
+
 // =====================
 // Scoring Engine
 // =====================
@@ -873,7 +940,6 @@ function spreadPercent(item) {
 
   return ((ask - bid) / mid) * 100;
 }
-
 function contractQualityScore(item, stock) {
   const volume = getVolume(item);
   const oi = getOI(item);
@@ -1051,6 +1117,7 @@ function getFlowBias(chain, stock) {
     strength: 'NEUTRAL'
   };
 }
+
 function isCandidateContract(
   item,
   stock,
@@ -1129,7 +1196,6 @@ function isCandidateContract(
 
   return true;
 }
-
 function contractScore(
   item,
   stock,
@@ -1324,6 +1390,7 @@ function selectBestContract(
     technicalStopReason: null
   };
 }
+
 // =====================
 // Trade Messages
 // =====================
@@ -1397,7 +1464,6 @@ ${new Date().toLocaleString('ar-SA', {
 
 🔥 ST TRADE VIP`;
 }
-
 async function sendTradeEntry(trade) {
   const image = await createTradeImage(trade.type);
   const text = buildTradeCaption(trade, 'entry');
@@ -1674,6 +1740,7 @@ ${trade.stockTarget2 ? fmtPrice(trade.stockTarget2) : 'غير متوفر'}
     }
   );
 }
+
 // =====================
 // Trade Updates
 // =====================
@@ -1733,7 +1800,6 @@ function findSameContract(chain, trade, fallbackItem) {
 
   return found || fallbackItem;
 }
-
 async function enrichTradeAnalysis(trade, snapshotItem) {
   const now = Date.now();
 
@@ -2018,7 +2084,6 @@ async function updateActiveTrades() {
     }
   }
 }
-
 // =====================
 // Scanner
 // =====================
@@ -2055,15 +2120,15 @@ async function scanSingleSymbol(symbol, force = false) {
   }
 
   if (force) {
-  const marketOpen = await isMarketOpenNow();
+    const marketOpen = await isMarketOpenNow();
 
-  if (!marketOpen) {
-    return {
-      ok: false,
-      message: '⛔ السوق مغلق حالياً.'
-    };
+    if (!marketOpen) {
+      return {
+        ok: false,
+        message: '⛔ السوق مغلق حالياً.'
+      };
+    }
   }
-}
 
   if (!isAllowedSignalTime(symbol)) {
     return {
