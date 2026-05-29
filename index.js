@@ -52,6 +52,10 @@ const TECHNICAL_STOP_CHECK_MS = 2 * 60 * 1000;
 const STOP_BREAK_BUFFER_PERCENT = 0.10;
 const STOP_LOOKBACK_BARS = 12;
 
+// الهدف الثاني الفني على السهم
+const TECHNICAL_TARGET_LOOKBACK_BARS = 60;
+const TECHNICAL_TARGET_BUFFER_PERCENT = 0.10;
+
 const MIN_CONTRACT_PRICE = 1.50;
 const MAX_CONTRACT_PRICE = 2.50;
 
@@ -214,7 +218,6 @@ function distancePercent(strike, stockPrice) {
 
   return Math.abs(((s - p) / p) * 100);
 }
-
 function daysToExpiration(dateStr) {
   if (!dateStr) return 999;
 
@@ -309,6 +312,7 @@ function isAllowedSignalTime(symbol) {
 
   return totalMinutes <= stocksEnd;
 }
+
 // =====================
 // Supabase
 // =====================
@@ -416,7 +420,6 @@ function markTradeActive(trade) {
   activeTrades.set(tradeKey(trade.symbol), trade);
   saveTradeToSupabase(trade);
 }
-
 async function loadOpenTradesFromSupabase() {
   try {
     const { data, error } = await supabase
@@ -448,6 +451,10 @@ async function loadOpenTradesFromSupabase() {
         current: Number(row.current_price),
 
         target: Number(row.target_price),
+        stockTarget2: null,
+        stockTarget2Sent: false,
+        target1Sent: false,
+
         stop: Number(row.stop_price),
 
         status: 'OPEN',
@@ -571,6 +578,21 @@ async function getIntradayCandles(symbol) {
   return data.results || [];
 }
 
+async function getLatestStockPrice(symbol) {
+  try {
+    const candles = await getIntradayCandles(symbol);
+
+    if (!candles || !candles.length) return null;
+
+    const last = candles[candles.length - 1];
+
+    return Number(last.c);
+  } catch (err) {
+    console.error(`Latest Stock Price Error ${symbol}:`, err.message);
+    return null;
+  }
+}
+
 async function getOptionsChain(symbol) {
   const url =
     `https://api.massive.com/v3/snapshot/options/${symbol}?limit=250&apiKey=${API_KEY}`;
@@ -588,6 +610,7 @@ async function getOptionSnapshot(symbol, contractTicker) {
 
   return data.results || data;
 }
+
 // =====================
 // Image Card
 // =====================
@@ -631,7 +654,6 @@ async function createTradeImage(type) {
 
   return await sharp(Buffer.from(svg)).png().toBuffer();
 }
-
 // =====================
 // Technical Engine
 // =====================
@@ -784,6 +806,45 @@ async function getTechnicalBias(symbol) {
   }
 }
 
+async function getTechnicalTarget2(symbol, type) {
+  try {
+    const candles = await getIntradayCandles(symbol);
+
+    if (!candles || candles.length < 40) {
+      return null;
+    }
+
+    const last = candles[candles.length - 1];
+    const price = Number(last.c);
+
+    const recent = candles.slice(-TECHNICAL_TARGET_LOOKBACK_BARS);
+
+    const resistance = Math.max(...recent.map(c => Number(c.h)));
+    const support = Math.min(...recent.map(c => Number(c.l)));
+
+    if (
+      type === 'CALL' &&
+      resistance &&
+      resistance > price * (1 + TECHNICAL_TARGET_BUFFER_PERCENT / 100)
+    ) {
+      return Number(resistance.toFixed(2));
+    }
+
+    if (
+      type === 'PUT' &&
+      support &&
+      support < price * (1 - TECHNICAL_TARGET_BUFFER_PERCENT / 100)
+    ) {
+      return Number(support.toFixed(2));
+    }
+
+    return null;
+
+  } catch (err) {
+    console.error(`Technical Target2 Error ${symbol}:`, err.message);
+    return null;
+  }
+}
 // =====================
 // Scoring Engine
 // =====================
@@ -897,6 +958,7 @@ function smartFlowScore(item, stock, flowBias = null) {
 
   return Math.min(score, 100);
 }
+
 function flowItemScore(item, stock) {
   const type = getContractType(item);
   const strike = getStrike(item);
@@ -989,7 +1051,6 @@ function getFlowBias(chain, stock) {
     strength: 'NEUTRAL'
   };
 }
-
 function isCandidateContract(
   item,
   stock,
@@ -1221,6 +1282,10 @@ function selectBestContract(
     stop,
     target,
 
+    stockTarget2: null,
+    stockTarget2Sent: false,
+    target1Sent: false,
+
     score: best.score,
 
     technicalBias: technicalBias?.side || 'NEUTRAL',
@@ -1268,7 +1333,7 @@ function buildTradeCaption(trade, mode = 'entry') {
 
   const statusLine =
     trade.status === 'TARGET'
-      ? '🎯 الحالة: تم تحقيق الهدف'
+      ? '🎯 الحالة: تم تحقيق الهدف الفني الثاني'
       : trade.status === 'STOPPED'
         ? '❌ الحالة: تم الخروج بوقف فني'
         : '🟢 الحالة: الصفقة مفتوحة';
@@ -1277,6 +1342,11 @@ function buildTradeCaption(trade, mode = 'entry') {
     mode === 'update'
       ? '🚀 تحديث صفقة ST VIP'
       : '🚨 صفقة ST VIP';
+
+  const target2Line =
+    trade.stockTarget2
+      ? `🎯 الهدف الثاني الفني على السهم: ${fmtPrice(trade.stockTarget2)}`
+      : `🎯 الهدف الثاني الفني على السهم: غير متوفر حاليًا`;
 
   return `${title}
 
@@ -1291,7 +1361,8 @@ ${statusLine}
 💵 الحالي: $${fmtPrice(trade.current)}
 📈 الربح/الخسارة: ${percent}%
 
-🎯 الهدف: $${fmtPrice(trade.target)}
+🎯 الهدف الأول على العقد: $${fmtPrice(trade.target)}
+${target2Line}
 🛑 الوقف: وقف فني فقط
 
 💵 Bid: $${fmtPrice(trade.bid)}
@@ -1382,6 +1453,11 @@ async function sendTradeUpdate(trade) {
 
   const percent = pnlPercent(trade.entry, trade.current);
 
+  const target2Line =
+    trade.stockTarget2
+      ? `🎯 الهدف الثاني الفني على السهم:\n${fmtPrice(trade.stockTarget2)}`
+      : `🎯 الهدف الثاني الفني على السهم:\nغير متوفر حاليًا`;
+
   const text =
 `🚀 تحديث الصفقة
 
@@ -1403,8 +1479,10 @@ ${percent}%
 
 ━━━━━━━━━━━━━━
 
-🎯 الهدف:
+🎯 الهدف الأول على العقد:
 $${fmtPrice(trade.target)}
+
+${target2Line}
 
 🛑 الوقف:
 وقف فني فقط
@@ -1450,11 +1528,57 @@ ${percent}%
 
 ━━━━━━━━━━━━━━
 
-🎯 الهدف:
+🎯 الهدف الأول على العقد:
 $${fmtPrice(trade.target)}
+
+🎯 الهدف الثاني الفني على السهم:
+${trade.stockTarget2 ? fmtPrice(trade.stockTarget2) : 'غير متوفر حاليًا'}
 
 🛑 الوقف:
 وقف فني فقط
+
+🔥 ST TRADE VIP`;
+
+  await bot.sendMessage(
+    CHAT_ID,
+    text,
+    {
+      message_thread_id: THREAD_ID
+    }
+  );
+}
+
+async function sendTarget1Hit(trade) {
+  trade.target1Sent = true;
+
+  await updateTradeInSupabase(trade);
+  await editTradeCaption(trade);
+
+  const text =
+`🎯 تم تحقيق الهدف الأول
+
+📊 ${tradeTitle(trade)}
+
+📅 الانتهاء:
+${trade.expiration}
+
+━━━━━━━━━━━━━━
+
+💰 الدخول:
+$${fmtPrice(trade.entry)}
+
+💵 سعر العقد الحالي:
+$${fmtPrice(trade.current)}
+
+📈 الربح الحالي:
+${pnlPercent(trade.entry, trade.current)}%
+
+━━━━━━━━━━━━━━
+
+🎯 الهدف الثاني الفني على السهم:
+${trade.stockTarget2 ? fmtPrice(trade.stockTarget2) : 'غير متوفر حاليًا'}
+
+✅ الصفقة مستمرة للهدف الفني الثاني
 
 🔥 ST TRADE VIP`;
 
@@ -1521,7 +1645,7 @@ async function sendTargetHit(trade) {
   const percent = pnlPercent(trade.entry, trade.current);
 
   const text =
-`🎯 تم تحقيق الهدف
+`🎯 تم تحقيق الهدف الفني الثاني
 
 📊 ${tradeTitle(trade)}
 
@@ -1533,11 +1657,14 @@ ${trade.expiration}
 💰 الدخول:
 $${fmtPrice(trade.entry)}
 
-💵 السعر الحالي:
+💵 سعر العقد الحالي:
 $${fmtPrice(trade.current)}
 
 📈 الربح النهائي:
 ${percent}%
+
+🎯 هدف السهم الفني:
+${trade.stockTarget2 ? fmtPrice(trade.stockTarget2) : 'غير متوفر'}
 
 🔥 ST TRADE VIP`;
 
@@ -1631,6 +1758,13 @@ async function enrichTradeAnalysis(trade, snapshotItem) {
     const flowBias = getFlowBias(chain, stock);
 
     const item = findSameContract(chain, trade, snapshotItem);
+
+    if (!trade.stockTarget2) {
+      trade.stockTarget2 = await getTechnicalTarget2(
+        trade.symbol,
+        trade.type
+      );
+    }
 
     if (!item) {
       trade.technicalBias = technicalBias?.side || trade.technicalBias || 'غير متوفر';
@@ -1821,6 +1955,15 @@ async function updateActiveTrades() {
 
       trade.current = current;
 
+      if (!trade.stockTarget2) {
+        trade.stockTarget2 = await getTechnicalTarget2(
+          trade.symbol,
+          trade.type
+        );
+      }
+
+      const stockPrice = await getLatestStockPrice(trade.symbol);
+
       const profitNow = Number(pnlPercent(trade.entry, trade.current));
 
       if (profitNow >= 10 && !trade.profit10Sent) {
@@ -1848,7 +1991,18 @@ async function updateActiveTrades() {
         continue;
       }
 
-      if (trade.current >= trade.target) {
+      if (trade.current >= trade.target && !trade.target1Sent) {
+        await sendTarget1Hit(trade);
+      }
+
+      if (
+        trade.stockTarget2 &&
+        stockPrice &&
+        (
+          (trade.type === 'CALL' && stockPrice >= trade.stockTarget2) ||
+          (trade.type === 'PUT' && stockPrice <= trade.stockTarget2)
+        )
+      ) {
         await sendTargetHit(trade);
         removeTrade(symbol);
         continue;
@@ -1866,6 +2020,7 @@ async function updateActiveTrades() {
     }
   }
 }
+
 // =====================
 // Scanner
 // =====================
@@ -1957,6 +2112,11 @@ async function scanSingleSymbol(symbol, force = false) {
       message: `⚠️ لا توجد صفقة قوية مطابقة للشروط على ${symbol}.`
     };
   }
+
+  trade.stockTarget2 = await getTechnicalTarget2(
+    symbol,
+    trade.type
+  );
 
   if (!force && wasSentToday(trade)) {
     return {
@@ -2089,7 +2249,7 @@ bot.onText(/\/botstatus/, async (msg) => {
     [...activeTrades.values()]
       .map(
         t =>
-          `• ${t.symbol} ${t.type} ${t.strike} | دخول $${fmtPrice(t.entry)} | حالي $${fmtPrice(t.current)} | عقد ${t.contractTicker || 'غير متوفر'}`
+          `• ${t.symbol} ${t.type} ${t.strike} | دخول $${fmtPrice(t.entry)} | حالي $${fmtPrice(t.current)} | عقد ${t.contractTicker || 'غير متوفر'} | هدف فني ${t.stockTarget2 ? fmtPrice(t.stockTarget2) : 'غير متوفر'}`
       )
       .join('\n');
 
