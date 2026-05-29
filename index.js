@@ -978,7 +978,7 @@ function contractQualityScore(item, stock) {
   if (oi >= 2000) score += 5;
   else if (oi >= 500) score += 3;
 
-  if (dte >= 0 && dte <= 3) score += 8;
+  if (dte >= 1 && dte <= 3) score += 8;
   else if (dte <= 7) score += 5;
 
   if (iv > 0 && iv <= 1.2) score += 5;
